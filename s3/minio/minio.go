@@ -429,7 +429,7 @@ func (m *Minio) AccessURL(ctx context.Context, name string, expire time.Duration
 			reqParams.Set("response-content-type", opt.ContentType)
 		}
 		if opt.Filename != "" {
-			reqParams.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(opt.Filename))
+			reqParams.Set("response-content-disposition", opt.GetContentDisposition())
 		}
 	}
 	if opt.Image == nil || (opt.Image.Width < 0 && opt.Image.Height < 0 && opt.Image.Format == "") || (opt.Image.Width > maxImageWidth || opt.Image.Height > maxImageHeight) {

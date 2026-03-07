@@ -325,7 +325,7 @@ func (c *Cos) AccessURL(ctx context.Context, name string, expire time.Duration, 
 			query.Set("response-content-type", opt.ContentType)
 		}
 		if opt.Filename != "" {
-			query.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(opt.Filename))
+			query.Set("response-content-disposition", opt.GetContentDisposition())
 		}
 		if len(query) > 0 {
 			option.Query = &query

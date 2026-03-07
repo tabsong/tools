@@ -333,7 +333,7 @@ func (d *disableHTTPPresignerHeaderV4) setOption(u *url.URL) {
 		query.Set("response-content-type", d.opt.ContentType)
 	}
 	if d.opt.Filename != "" {
-		query.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(d.opt.Filename))
+		query.Set("response-content-disposition", d.opt.GetContentDisposition())
 	}
 	u.RawQuery = query.Encode()
 }
