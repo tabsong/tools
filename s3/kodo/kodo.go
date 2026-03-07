@@ -304,7 +304,7 @@ func (k *Kodo) AccessURL(ctx context.Context, name string, expire time.Duration,
 			params.ResponseContentType = aws.String(opt.ContentType)
 		}
 		if opt.Filename != "" {
-			params.ResponseContentDisposition = aws.String(`attachment; filename*=UTF-8''` + url.PathEscape(opt.Filename))
+			params.ResponseContentDisposition = aws.String(opt.GetContentDisposition())
 		}
 	}
 	res, err := k.PresignClient.PresignGetObject(ctx, params, awss3.WithPresignExpires(expire), withDisableHTTPPresignerHeaderV4(opt))
@@ -438,7 +438,7 @@ func (d *disableHTTPPresignerHeaderV4) setOption(u *url.URL) {
 		query.Set("response-content-type", d.opt.ContentType)
 	}
 	if d.opt.Filename != "" {
-		query.Set("response-content-disposition", `attachment; filename*=UTF-8''`+url.PathEscape(d.opt.Filename))
+		query.Set("response-content-disposition", d.opt.GetContentDisposition())
 	}
 	u.RawQuery = query.Encode()
 }

@@ -134,7 +134,16 @@ type Image struct {
 type AccessURLOption struct {
 	ContentType string `json:"contentType"`
 	Filename    string `json:"filename"`
+	Inline      bool   `json:"inline"`
 	Image       *Image `json:"image"`
+}
+
+func (o *AccessURLOption) GetContentDisposition() string {
+	disposition := "attachment"
+	if o.Inline {
+		disposition = "inline"
+	}
+	return disposition + `; filename*=UTF-8''` + url.PathEscape(o.Filename)
 }
 
 type PutOption struct {

@@ -350,7 +350,7 @@ func (o *OSS) AccessURL(ctx context.Context, name string, expire time.Duration, 
 				opts = append(opts, oss.ResponseContentType(opt.ContentType))
 			}
 			if opt.Filename != "" {
-				opts = append(opts, oss.ResponseContentDisposition(`attachment; filename*=UTF-8''`+url.PathEscape(opt.Filename)))
+				opts = append(opts, oss.ResponseContentDisposition(opt.GetContentDisposition()))
 			}
 		}
 	}
