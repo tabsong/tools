@@ -17,7 +17,6 @@ import (
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/naming/endpoints"
-	"go.etcd.io/etcd/client/v3/naming/resolver"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
@@ -29,6 +28,8 @@ const (
 	defaultLeaseTTL        = int64(30)
 	keepAliveRetryDelay    = time.Second
 	defaultCloseTimeout    = 5 * time.Second
+	watchRetryInitialDelay = 100 * time.Millisecond
+	watchRetryMaxDelay     = 3 * time.Second
 )
 
 // CfgOption defines a function type for modifying clientv3.Config
@@ -37,6 +38,13 @@ type addrConn struct {
 	conn        *grpc.ClientConn
 	addr        string
 	isConnected bool
+}
+
+// serviceWatcher is the handle for one service's watch goroutine. It exists so
+// the goroutine can retire its own map entry without racing a watch that a later
+// ensureServiceWatch already put in its place.
+type serviceWatcher struct {
+	cancel context.CancelFunc
 }
 
 // SvcDiscoveryRegistryImpl implementation
@@ -56,7 +64,7 @@ type SvcDiscoveryRegistryImpl struct {
 	connMap            map[string][]*addrConn
 	serviceDialOptions map[string][]grpc.DialOption
 	serviceWatchMu     sync.Mutex
-	serviceWatchers    map[string]context.CancelFunc
+	serviceWatchers    map[string]*serviceWatcher
 	watchKeyMu         sync.Mutex
 	watchKeyEntries    map[string]*watchKeyEntry
 
@@ -154,25 +162,75 @@ func (s *watchKeySubscriber) push(event *discovery.WatchKey) bool {
 	}
 }
 
+// run follows one key prefix for as long as anyone is subscribed. Like the
+// service watch, a broken watch is retried rather than treated as the end of the
+// stream: ending it closes every subscriber and leaves WatchKey returning nil to
+// its caller, which reads as an orderly finish and leaves nobody to notice that
+// updates simply stopped.
 func (e *watchKeyEntry) run(r *SvcDiscoveryRegistryImpl) {
 	defer func() {
 		e.closeSubscribers()
 		r.removeWatchKeyEntry(e.key, e)
 	}()
 
-	watchChan := r.client.Watch(e.ctx, e.key, clientv3.WithPrefix())
+	delay := watchRetryInitialDelay
+	replay := false
+	for e.ctx.Err() == nil {
+		err := e.watchOnce(r, replay, func() { delay = watchRetryInitialDelay })
+		if e.ctx.Err() != nil {
+			return
+		}
+		log.ZWarn(e.ctx, "key watch interrupted, retrying", err,
+			zap.String("key", e.key), zap.Duration("retryIn", delay))
+		if !sleepWithContext(e.ctx, delay) {
+			return
+		}
+		delay = min(delay*2, watchRetryMaxDelay)
+		// Whatever changed while the watch was down produced no event, so every
+		// later attempt republishes the current state and lets subscribers
+		// converge. The first attempt does not: callers subscribe for changes,
+		// and a stream that opens with the whole prefix would be a surprise.
+		replay = true
+	}
+}
+
+// watchOnce reads the prefix, optionally republishes it, then follows it from
+// that exact revision so nothing slips through between the two.
+func (e *watchKeyEntry) watchOnce(r *SvcDiscoveryRegistryImpl, replay bool, recovered func()) error {
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+
+	r.mu.RLock()
+	client := r.client
+	r.mu.RUnlock()
+	if client == nil {
+		return errs.New("etcd client closed", "key", e.key)
+	}
+
+	snapshot, err := client.Get(ctx, e.key, clientv3.WithPrefix())
+	if err != nil {
+		return err
+	}
+	if replay {
+		for _, kv := range snapshot.Kvs {
+			e.broadcast(r, &discovery.WatchKey{Type: discovery.WatchTypePut, Key: kv.Key, Value: kv.Value})
+		}
+	}
+
+	updates := client.Watch(ctx, e.key, clientv3.WithPrefix(),
+		clientv3.WithRev(snapshot.Header.Revision+1), clientv3.WithProgressNotify())
 	for {
 		select {
-		case <-e.ctx.Done():
-			return
-		case resp, ok := <-watchChan:
-			if !ok {
-				return
+		case <-ctx.Done():
+			return ctx.Err()
+		case resp, open := <-updates:
+			if !open {
+				return errs.New("key watch closed", "key", e.key)
 			}
-			if resp.Err() != nil {
-				log.ZWarn(context.Background(), "watch key resp err", resp.Err(), zap.String("key", e.key))
-				continue
+			if err := resp.Err(); err != nil {
+				return err
 			}
+			recovered()
 			for _, event := range resp.Events {
 				watchKey := &discovery.WatchKey{Key: event.Kv.Key, Value: event.Kv.Value}
 				switch event.Type {
@@ -224,10 +282,11 @@ func NewSvcDiscoveryRegistry(rootDirectory string, endpoints []string, watchName
 	if err != nil {
 		return nil, err
 	}
-	r, err := resolver.NewBuilder(client)
-	if err != nil {
-		return nil, err
-	}
+	// Use the self-healing resolver instead of etcd's official one: that one
+	// abandons its watch for good on any error (ErrCompacted is routine), and
+	// its ResolveNow is a no-op, so a client whose watch died keeps dialing
+	// addresses that no longer exist until the process restarts.
+	r := resolverBuilder{client: client}
 
 	s := &SvcDiscoveryRegistryImpl{
 		client:             client,
@@ -236,7 +295,7 @@ func NewSvcDiscoveryRegistry(rootDirectory string, endpoints []string, watchName
 		connMap:            make(map[string][]*addrConn),
 		serviceDialOptions: make(map[string][]grpc.DialOption),
 		watchNames:         watchNames,
-		serviceWatchers:    make(map[string]context.CancelFunc),
+		serviceWatchers:    make(map[string]*serviceWatcher),
 		watchKeyEntries:    make(map[string]*watchKeyEntry),
 	}
 
@@ -619,38 +678,98 @@ func (r *SvcDiscoveryRegistryImpl) ensureServiceWatch(service string) error {
 	}
 
 	watchCtx, cancel := context.WithCancel(context.Background())
-	r.serviceWatchers[service] = cancel
+	watcher := &serviceWatcher{cancel: cancel}
+	r.serviceWatchers[service] = watcher
 	r.serviceWatchMu.Unlock()
 
-	go r.runServiceWatch(watchCtx, service)
+	go r.runServiceWatch(watchCtx, service, watcher)
 
 	return nil
 }
 
-func (r *SvcDiscoveryRegistryImpl) runServiceWatch(ctx context.Context, service string) {
-	watchChan := r.client.Watch(ctx, fmt.Sprintf("%s/%s", r.rootDirectory, service), clientv3.WithPrefix())
+// runServiceWatch keeps one service's connection map in step with etcd. Each
+// attempt resyncs from a full snapshot and then follows the prefix; when the
+// watch breaks — a compacted revision is routine, not exceptional — the loop
+// backs off and starts over instead of returning. Returning would strand the map
+// on addresses that no longer resolve, and GetConns only refetches when the map
+// is empty, so a stale-but-populated map is never revisited: every caller keeps
+// dialing dead pods until the process restarts.
+func (r *SvcDiscoveryRegistryImpl) runServiceWatch(ctx context.Context, service string, watcher *serviceWatcher) {
+	defer r.clearServiceWatcher(service, watcher)
+
+	delay := watchRetryInitialDelay
+	for ctx.Err() == nil {
+		err := r.watchServiceOnce(ctx, service, func() { delay = watchRetryInitialDelay })
+		if ctx.Err() != nil {
+			return
+		}
+		log.ZWarn(ctx, "service watch interrupted, retrying", err,
+			zap.String("service", service), zap.Duration("retryIn", delay))
+		if !sleepWithContext(ctx, delay) {
+			return
+		}
+		delay = min(delay*2, watchRetryMaxDelay)
+	}
+}
+
+// watchServiceOnce runs a single snapshot-then-follow cycle, returning the error
+// that ended it so the caller can decide whether to retry.
+func (r *SvcDiscoveryRegistryImpl) watchServiceOnce(ctx context.Context, service string, recovered func()) error {
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	r.mu.RLock()
+	client := r.client
+	r.mu.RUnlock()
+	if client == nil {
+		return errs.New("etcd client closed", "service", service)
+	}
+
+	if err := r.initializeConnMap(service); err != nil {
+		return err
+	}
+
+	updates := client.Watch(watchCtx, fmt.Sprintf("%s/%s", r.rootDirectory, service),
+		clientv3.WithPrefix(), clientv3.WithProgressNotify())
 	for {
 		select {
-		case <-ctx.Done():
-			return
-		case _, ok := <-watchChan:
-			if !ok {
-				return
+		case <-watchCtx.Done():
+			return watchCtx.Err()
+		case update, open := <-updates:
+			if !open {
+				return errs.New("service watch closed", "service", service)
+			}
+			if err := update.Err(); err != nil {
+				return err
+			}
+			recovered()
+			if len(update.Events) == 0 {
+				continue
 			}
 			if err := r.initializeConnMap(service); err != nil {
-				log.ZWarn(context.Background(), "initializeConnMap in watch err", err, zap.String("service", service))
+				log.ZWarn(watchCtx, "initializeConnMap in watch err", err, zap.String("service", service))
 			}
 		}
 	}
 }
 
+// clearServiceWatcher retires the map entry, but only while it still points at
+// this goroutine's own watcher.
+func (r *SvcDiscoveryRegistryImpl) clearServiceWatcher(service string, watcher *serviceWatcher) {
+	r.serviceWatchMu.Lock()
+	if current, ok := r.serviceWatchers[service]; ok && current == watcher {
+		delete(r.serviceWatchers, service)
+	}
+	r.serviceWatchMu.Unlock()
+}
+
 func (r *SvcDiscoveryRegistryImpl) stopServiceWatches() {
 	r.serviceWatchMu.Lock()
 	cancels := make([]context.CancelFunc, 0, len(r.serviceWatchers))
-	for _, cancel := range r.serviceWatchers {
-		cancels = append(cancels, cancel)
+	for _, watcher := range r.serviceWatchers {
+		cancels = append(cancels, watcher.cancel)
 	}
-	r.serviceWatchers = make(map[string]context.CancelFunc)
+	r.serviceWatchers = make(map[string]*serviceWatcher)
 	r.serviceWatchMu.Unlock()
 
 	for _, cancel := range cancels {
